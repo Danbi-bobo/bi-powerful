@@ -1,0 +1,6 @@
+httpx
+pandas
+dotenv
+mysql-connector-python
+pydash
+google-ads
