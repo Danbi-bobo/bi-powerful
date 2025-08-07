@@ -1,10 +1,12 @@
 import sys
 import os
 import json
-import pandas as pd
+import logging
 from dotenv import load_dotenv
-from numpy import nan
+from datetime import datetime
+import time
 
+sys.stdout.reconfigure(encoding='utf-8')
 load_dotenv()
 
 CDP_PATH = os.getenv("CDP_PATH")
@@ -17,75 +19,206 @@ from cdp.domain.utils.log_helper import setup_logger
 
 db_golden_name = os.getenv("DB_GOLDEN_NAME")
 golden_table_name = "pos_order_sources"
-db_raw_name = os.getenv("DB_RAW_NAME")
-raw_table_name = "raw_" + golden_table_name
 
-new_rows = pd.DataFrame({
-    "shop_id": ['*', '*', '*'],
-    "id": ['-403', '-404', '-405'],
-    "name": [
-        'Đơn hàng không có nguồn đơn',
-        'Đã có dòng trên bảng UTM nhưng chưa chọn nguồn đơn',
-        'Page chạy quảng cáo chưa được link vào POS'
-    ]
-})
-
-numeric_cols = []
-string_cols = ['shop_id', 'name', 'custom_id', 'id', 'link_source_id', 'parent_id', 'project_id']
-datetime_cols = ['inserted_at', 'updated_at']
-golden_cols = numeric_cols + string_cols + datetime_cols
+# Default order sources (no pandas)
+default_sources = [
+    {
+        'shop_id': '*',
+        'id': '-403',
+        'name': 'Đơn hàng không có nguồn đơn',
+        'custom_id': None,
+        'link_source_id': None,
+        'parent_id': None,
+        'project_id': None,
+        'inserted_at': datetime.now(),
+        'updated_at': datetime.now()
+    },
+    {
+        'shop_id': '*',
+        'id': '-404',
+        'name': 'Đã có dòng trên bảng UTM nhưng chưa chọn nguồn đơn',
+        'custom_id': None,
+        'link_source_id': None,
+        'parent_id': None,
+        'project_id': None,
+        'inserted_at': datetime.now(),
+        'updated_at': datetime.now()
+    },
+    {
+        'shop_id': '*',
+        'id': '-405',
+        'name': 'Page chạy quảng cáo chưa được link vào POS',
+        'custom_id': None,
+        'link_source_id': None,
+        'parent_id': None,
+        'project_id': None,
+        'inserted_at': datetime.now(),
+        'updated_at': datetime.now()
+    }
+]
 
 def load_config_shops():
     config_file = rf"{CDP_PATH}/entries/golden/pos/config_shops.json"
-    with open(config_file, 'r') as file:
+    with open(config_file, 'r', encoding='utf-8') as file:
         return json.load(file).get('shops', [])
 
-def get_order_sources_from_api():
-    shops = load_config_shops()
+def clean_unicode_text(text):
+    if not isinstance(text, str):
+        return text
+    return text.encode('utf-8', errors='ignore').decode('utf-8')
 
-    for shop in shops:
-        shop_id = shop['shop_id']
-        api_key = shop['api_key']
-        result = []
-        if not (shop_id and api_key):
-            return result
-        pos_handler = PosAPIHandler(shop_id=shop_id, api_key=api_key)
-        order_sources_from_api = pos_handler.get_all(endpoint='order_source')
-        result.extend(order_sources_from_api)
+def clean_id_field(value):
+    """Clean ID fields - remove decimal points"""
+    if value is None or value == '':
+        return None
+    return str(value).split('.')[0]
+
+def process_single_shop(shop_id, api_key):
+    """Process one shop and insert immediately"""
+    logging.info(f"Processing shop: {shop_id}")
     
-    return result
+    try:
+        pos_handler = PosAPIHandler(shop_id=shop_id, api_key=api_key)
+        order_sources = pos_handler.get_all(endpoint='order_source')
+        
+        if not order_sources:
+            logging.warning(f"No sources found for shop {shop_id}")
+            return 0
+        
+        logging.info(f"Shop {shop_id}: {len(order_sources)} sources retrieved")
+        
+        # Process data without pandas
+        processed_data = []
+        
+        for source in order_sources:
+            # Clean and prepare record
+            record = {
+                'shop_id': str(shop_id),
+                'id': clean_id_field(source.get('id')),
+                'name': clean_unicode_text(str(source.get('name', ''))) if source.get('name') else None,
+                'custom_id': clean_unicode_text(str(source.get('custom_id', ''))) if source.get('custom_id') else None,
+                'link_source_id': clean_id_field(source.get('link_source_id')),
+                'parent_id': clean_id_field(source.get('parent_id')),
+                'project_id': clean_id_field(source.get('project_id')),
+                'inserted_at': datetime.now(),
+                'updated_at': datetime.now()
+            }
+            
+            # Convert datetime fields if they exist in source
+            if source.get('inserted_at'):
+                try:
+                    record['inserted_at'] = datetime.fromisoformat(str(source['inserted_at']).replace('Z', ''))
+                except:
+                    record['inserted_at'] = datetime.now()
+            
+            if source.get('updated_at'):
+                try:
+                    record['updated_at'] = datetime.fromisoformat(str(source['updated_at']).replace('Z', ''))
+                except:
+                    record['updated_at'] = datetime.now()
+            
+            # Clean empty strings
+            for key, value in record.items():
+                if value == '' or value == 'nan' or value == 'None':
+                    record[key] = None
+            
+            processed_data.append(record)
+        
+        # Insert in small batches immediately
+        batch_size = 100
+        total_inserted = 0
+        
+        for i in range(0, len(processed_data), batch_size):
+            batch = processed_data[i:i+batch_size]
+            batch_num = i // batch_size + 1
+            
+            try:
+                MariaDBHandler().insert_and_update_from_dict(
+                    database=db_golden_name,
+                    table=golden_table_name,
+                    data=batch,
+                    unique_columns=['shop_id', 'id']
+                )
+                total_inserted += len(batch)
+                logging.info(f"Shop {shop_id} - Batch {batch_num}: {len(batch)} records inserted")
+                time.sleep(0.2)
+                
+            except Exception as e:
+                logging.error(f"Shop {shop_id} - Batch {batch_num} failed: {e}")
+                continue
+        
+        logging.info(f"Shop {shop_id} completed: {total_inserted}/{len(processed_data)} records inserted")
+        return total_inserted
+        
+    except Exception as e:
+        logging.error(f"Shop {shop_id} processing failed: {e}")
+        return 0
 
-def prepare_raw_df(order_sources_list):
-    raw_df = pd.DataFrame(order_sources_list)
-    raw_df = raw_df[golden_cols]
-    return raw_df
-
-def prepare_golden_df(raw_df):
-    df = raw_df.copy()
-    df = pd.concat([df, new_rows], ignore_index=True)
-    id_cols = ['parent_id', 'id', 'link_source_id']
-    df.replace(nan, None, inplace=True)
-    df[id_cols] = df[id_cols].apply(lambda col: col.map(lambda x: str(x).split('.')[0]))
-    df[datetime_cols] = df[datetime_cols].apply(pd.to_datetime, errors='coerce')
-    df[string_cols] = df[string_cols].astype(str)
-    df.replace('None', None, inplace=True)
-    return df
+def insert_default_sources():
+    """Insert default order sources"""
+    try:
+        MariaDBHandler().insert_and_update_from_dict(
+            database=db_golden_name,
+            table=golden_table_name,
+            data=default_sources,
+            unique_columns=['shop_id', 'id']
+        )
+        logging.info("Default sources inserted")
+    except Exception as e:
+        logging.warning(f"Default sources insert failed: {e}")
 
 def get_order_sources():
-    order_sources = get_order_sources_from_api()
-    raw_df = prepare_raw_df(order_sources)
-    golden_df = prepare_golden_df(raw_df)
-    return golden_df
+    """Main function - process each shop individually"""
+    shops = load_config_shops()
+    logging.info(f"Processing {len(shops)} shops")
+    
+    # Insert default sources first
+    insert_default_sources()
+    
+    total_inserted = 0
+    successful_shops = 0
+    
+    for shop in shops:
+        shop_id = shop.get('shop_id')
+        api_key = shop.get('api_key')
+        
+        if not (shop_id and api_key):
+            logging.warning(f"Skipping shop {shop_id}: missing credentials")
+            continue
+        
+        records_inserted = process_single_shop(shop_id, api_key)
+        
+        if records_inserted > 0:
+            total_inserted += records_inserted
+            successful_shops += 1
+        
+        # Delay between shops
+        time.sleep(2)
+    
+    logging.info(f"Processing completed: {successful_shops}/{len(shops)} shops successful")
+    logging.info(f"Total records inserted: {total_inserted}")
+    
+    # Final verification
+    try:
+        db = MariaDBHandler()
+        result = db.read_from_db(
+            query="SELECT COUNT(*) as total FROM pos_order_sources",
+            database=db_golden_name
+        )
+        total_in_db = result.iloc[0, 0] if result is not None else 0
+        logging.info(f"Total records in database: {total_in_db}")
+        
+    except Exception as e:
+        logging.warning(f"Could not verify final count: {e}")
 
 if __name__ == "__main__":
     setup_logger(__file__)
+    logging.info("Starting POS Order Sources extraction (No Pandas)")
     
-    order_sources = get_order_sources_from_api()
-    raw_df = prepare_raw_df(order_sources)
-    golden_df = prepare_golden_df(raw_df)
-
-    # if not raw_df.empty:
-    #     raw_df = raw_df.astype(str)
-    #     MariaDBHandler().insert_and_update_from_df(db_raw_name, raw_table_name, raw_df, unique_columns=["id", "shop_id"])
-    if not golden_df.empty:
-        MariaDBHandler().insert_and_update_from_df(db_golden_name, golden_table_name, golden_df, unique_columns=["id", "shop_id"], log=True, updated_flag=True)
+    try:
+        get_order_sources()
+        logging.info("POS Order Sources extraction completed")
+        
+    except Exception as e:
+        logging.error(f"Fatal error: {e}")
+        raise
