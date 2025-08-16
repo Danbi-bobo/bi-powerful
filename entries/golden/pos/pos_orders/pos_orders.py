@@ -141,6 +141,7 @@ def process_single_order(order, shop_id):
         # Extract transformed fields
         record = {
             'order_id': str(order.get('id', '')),
+            'ad_id': order.get('p_utm_content') if order.get('p_utm_content') else order.get('ad_id') if order.get('ad_id') else None,
             'shop_id': str(shop_id),
             'status': order.get('status'),
             'partner_name': partner.get('partner_name'),
@@ -160,7 +161,11 @@ def process_single_order(order, shop_id):
             'shipping_address': shipping_address.get('full_address') if shipping_address else None,
             'bill_full_name': clean_unicode_text(order.get('bill_full_name', '')),
             'order_sources': order.get('order_sources'),
+            'ads_sources': order.get('ads_source'),
+            'sub_status': order.get('sub_status'),
+            'warehouse_id': order.get('warehouse_id'),
             'assigning_seller_id': order.get('assigning_seller_id'),
+            'marketer': order.get('marketer').get('id') if order.get('marketer') else None,
             'assigning_care_id': order.get('assigning_care_id'),
             'note': clean_unicode_text(order.get('note', '')) if order.get('note') else None,
             'tags': json.dumps(order.get('tags', []), ensure_ascii=False) if order.get('tags') else None,
