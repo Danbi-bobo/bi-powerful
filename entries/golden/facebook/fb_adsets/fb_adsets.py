@@ -27,8 +27,7 @@ def get_all_accounts():
     query = """
         SELECT id, name, token, market
         FROM ad_account
-        WHERE account_status IN (1, 3)
-        AND token IS NOT NULL AND token != ''
+        WHERE token IS NOT NULL AND token != ''
         ORDER BY market, name
     """
 
@@ -63,6 +62,9 @@ def extract_campaigns_for_account(account):
     account_id = account["id"]
     token = account["token"]
     market = account["market"]
+    
+    # ✅ Extract clean account ID từ account_id (bỏ "act_" prefix nếu có)
+    clean_account_id = account_id.replace('act_', '') if account_id.startswith('act_') else account_id
 
     try:
         fb_handler = FacebookAPIHandler(access_token=token, timeout=180, max_retries=2)
@@ -74,16 +76,17 @@ def extract_campaigns_for_account(account):
             "filtering": f"""[{{"field": "adset.updated_time", "operator": "GREATER_THAN", "value": "{START_DATE}"}}]""",
         }
 
-        campaigns = fb_handler.get_all(endpoint=adset_endpoint, params=params)
+        adsets = fb_handler.get_all(endpoint=adset_endpoint, params=params)
 
-        if campaigns:
+        if adsets:
             # Add metadata
-            for campaign in campaigns:
-                campaign["market"] = market
-                campaign["account_name"] = account["name"]
-                campaign["access_token"] = token
+            for adset in adsets:
+                adset["market"] = market
+                adset["account_name"] = account["name"]
+                adset["access_token"] = token
+                adset["clean_account_id"] = clean_account_id  # ✅ Pass clean account ID
 
-            return campaigns
+            return adsets
         else:
             return []
 
@@ -105,18 +108,30 @@ def save_campaigns_batch(adset_list):
 
         for adset in adset_list:
             try:
+                # ✅ Lấy account_id từ API response, fallback về clean_account_id từ URL
+                api_account_id = adset.get('account_id')
+                clean_account_id = adset.get('clean_account_id')  # From URL without "act_"
+                
+                # Priority: API response -> Clean URL account ID
+                final_account_id = None
+                if api_account_id:
+                    # API trả về account_id, bỏ "act_" nếu có
+                    final_account_id = str(api_account_id).replace('act_', '') if str(api_account_id).startswith('act_') else str(api_account_id)
+                elif clean_account_id:
+                    # Fallback to clean account ID from URL
+                    final_account_id = str(clean_account_id)
+
                 clean_record = {
-                    "campaign_id": str(adset.get("campaign_id", "")),
+                    "campaign_id": str(adset.get("campaign_id", "")) if adset.get("campaign_id") else None,
+                    "account_id": final_account_id,  # ✅ Sử dụng account ID đã xử lý
                     "adset_id": str(adset.get("id", "")),
-                    "adset_name": str(
-                        adset.get("name", "")
-                    ),  # sửa từ adset_name thành name
+                    "adset_name": str(adset.get("name", "")) if adset.get("name") else None,
                     "budget_remaining": (
                         int(adset["budget_remaining"])
                         if adset.get("budget_remaining")
                         else None
                     ),
-                    "status": str(adset.get("status", "")),
+                    "status": str(adset.get("status", "")) if adset.get("status") else None,
                     "created_time": adset.get("created_time"),
                     "updated_time": adset.get("updated_time"),
                     "daily_budget": (
@@ -124,20 +139,26 @@ def save_campaigns_batch(adset_list):
                         if adset.get("daily_budget")
                         else None
                     ),
-                    "optimization_goal": str(
-                        adset.get("optimization_goal", "")
-                    ),  # để string thay vì int
-                    "start_time": str(adset.get("start_time", ""))[:100],
-                    "market": str(adset.get("market", ""))[:100],
+                    "optimization_goal": str(adset.get("optimization_goal", "")) if adset.get("optimization_goal") else None,
+                    "start_time": str(adset.get("start_time", ""))[:100] if adset.get("start_time") else None,
+                    "market": str(adset.get("market", ""))[:100] if adset.get("market") else None,
                 }
 
-                # Keep non-null values
-                clean_record = {
-                    k: v for k, v in clean_record.items() if v is not None and v != ""
-                }
-                batch_records.append(clean_record)
+                # ✅ Chỉ loại bỏ các field bắt buộc nếu rỗng, giữ lại NULL values cho optional fields
+                if clean_record['adset_id']:  # Chỉ cần adset_id không rỗng
+                    # Convert empty strings to None for optional fields
+                    for key, value in clean_record.items():
+                        if value == '' and key != 'adset_id':  # adset_id không được phép rỗng
+                            clean_record[key] = None
+                    
+                    batch_records.append(clean_record)
+                    
+                    # ✅ Debug log để xem account_id được xử lý như thế nào
+                    if not api_account_id and clean_account_id:
+                        print(f"  🔄 Fallback account_id: {clean_account_id} for adset {clean_record['adset_id']}")
 
-            except Exception:
+            except Exception as e:
+                print(f"Error processing adset: {e}")
                 continue
 
         # Save all at once
@@ -172,7 +193,7 @@ def main():
     # Process accounts
     print(f"\nProcessing {len(accounts)} accounts...")
 
-    total_campaigns = 0
+    total_adsets = 0
     total_saved = 0
     success_accounts = 0
 
@@ -183,20 +204,20 @@ def main():
         # Show progress
         print(f"[{i:2d}/{len(accounts)}] {account_id} ({market})...", end=" ")
 
-        # Extract campaigns
-        campaigns = extract_campaigns_for_account(account)
+        # Extract adsets
+        adsets = extract_campaigns_for_account(account)
 
-        if campaigns:
-            total_campaigns += len(campaigns)
+        if adsets:
+            total_adsets += len(adsets)
 
-            # Save campaigns
-            saved = save_campaigns_batch(campaigns)
+            # Save adsets
+            saved = save_campaigns_batch(adsets)
             total_saved += saved
             success_accounts += 1
 
-            print(f"✅ {len(campaigns)} campaigns → {saved} saved")
+            print(f"✅ {len(adsets)} adsets → {saved} saved")
         else:
-            print("📭 No campaigns")
+            print("📭 No adsets")
 
         # Rate limiting
         if i < len(accounts):
@@ -205,9 +226,9 @@ def main():
     # Final summary
     duration = datetime.now() - start_time
 
-    if total_campaigns > 0:
-        success_rate = total_saved / total_campaigns * 100
-        print(f"   Success rate: {success_rate:.1f}%")
+    if total_adsets > 0:
+        success_rate = total_saved / total_adsets * 100
+        print(f"   Success rate: {success_rate:.1f}% - Duration: {duration}")
 
 
 if __name__ == "__main__":

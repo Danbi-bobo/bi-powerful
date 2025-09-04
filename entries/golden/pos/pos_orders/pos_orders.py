@@ -178,6 +178,7 @@ def process_single_order(order, shop_id):
             'returned_reason': order.get('returned_reason_name', '').split('/')[0] if order.get('returned_reason_name') and '/' in order.get('returned_reason_name', '') else order.get('returned_reason_name'),
             'returned_reason_detail': order.get('returned_reason_name', '').split('/')[1] if order.get('returned_reason_name') and '/' in order.get('returned_reason_name', '') else None,
             'sent_time': parse_datetime_safe(get_updated_at(order.get('histories'), None, 2)),
+            'confirmed_time': parse_datetime_safe(get_updated_at(order.get('histories'), None, 1)),
             'returned_time': parse_datetime_safe(get_updated_at(order.get('histories'), 4, 5)),
             'receive_time': parse_datetime_safe(get_updated_at(order.get('histories'), 2, 3)),
             'tags_id': extract_ids(order.get('tags', [])),

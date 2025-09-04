@@ -25,8 +25,7 @@ def get_all_accounts():
     query = """
         SELECT id, name, token, market
         FROM ad_account
-        WHERE account_status IN (1, 3)
-        AND token IS NOT NULL AND token != ''
+        WHERE token IS NOT NULL AND token != ''
         ORDER BY market, name
     """
     
@@ -64,6 +63,9 @@ def extract_campaigns_for_account(account):
     token = account['token']
     market = account['market']
     
+    # ✅ Extract clean account ID từ account_id (bỏ "act_" prefix nếu có)
+    clean_account_id = account_id.replace('act_', '') if account_id.startswith('act_') else account_id
+    
     try:
         fb_handler = FacebookAPIHandler(
             access_token=token,
@@ -86,6 +88,7 @@ def extract_campaigns_for_account(account):
                 campaign['market'] = market
                 campaign['account_name'] = account['name']
                 campaign['access_token'] = token
+                campaign['clean_account_id'] = clean_account_id  # ✅ Pass clean account ID
             
             return campaigns
         else:
@@ -109,25 +112,49 @@ def save_campaigns_batch(campaigns_list):
         
         for campaign in campaigns_list:
             try:
+                # ✅ Lấy account_id từ API response, fallback về clean_account_id từ URL
+                api_account_id = campaign.get('account_id')
+                clean_account_id = campaign.get('clean_account_id')  # From URL without "act_"
+                
+                # Priority: API response -> Clean URL account ID
+                final_account_id = None
+                if api_account_id:
+                    # API trả về account_id, bỏ "act_" nếu có
+                    final_account_id = str(api_account_id).replace('act_', '') if str(api_account_id).startswith('act_') else str(api_account_id)
+                elif clean_account_id:
+                    # Fallback to clean account ID from URL
+                    final_account_id = str(clean_account_id)
+                
                 clean_record = {
                     'campaign_id': str(campaign.get('id', '')),
-                    'campaign_name': str(campaign.get('name', ''))[:255],
-                    'campaign_status': str(campaign.get('status', '')),
+                    'account_id': final_account_id,  # ✅ Sử dụng account ID đã xử lý
+                    'campaign_name': str(campaign.get('name', ''))[:255] if campaign.get('name') else None,
+                    'campaign_status': str(campaign.get('status', '')) if campaign.get('status') else None,
                     'created_time': campaign.get('created_time'),
                     'updated_time': campaign.get('updated_time'),
                     'start_time': campaign.get('start_time'),
                     'daily_budget': int(campaign.get('daily_budget')) if campaign.get('daily_budget') else None,
                     'spend_cap': int(campaign.get('spend_cap')) if campaign.get('spend_cap') else None,
-                    'objective': str(campaign.get('objective', ''))[:100],
+                    'objective': str(campaign.get('objective', ''))[:100] if campaign.get('objective') else None,
                     'access_token': campaign.get('access_token'),
-                    'market': str(campaign.get('market', ''))[:100]
+                    'market': str(campaign.get('market', ''))[:100] if campaign.get('market') else None
                 }
                 
-                # Keep non-null values
-                clean_record = {k: v for k, v in clean_record.items() if v is not None and v != ''}
-                batch_records.append(clean_record)
+                # ✅ Chỉ loại bỏ các field bắt buộc nếu rỗng, giữ lại NULL values cho optional fields
+                if clean_record['campaign_id']:  # Chỉ cần campaign_id không rỗng
+                    # Convert empty strings to None for optional fields
+                    for key, value in clean_record.items():
+                        if value == '' and key != 'campaign_id':  # campaign_id không được phép rỗng
+                            clean_record[key] = None
+                    
+                    batch_records.append(clean_record)
+                    
+                    # ✅ Debug log để xem account_id được xử lý như thế nào
+                    if not api_account_id and clean_account_id:
+                        print(f"  🔄 Fallback account_id: {clean_account_id} for campaign {clean_record['campaign_id']}")
                 
-            except Exception:
+            except Exception as e:
+                print(f"Error processing campaign: {e}")
                 continue
         
         # Save all at once
@@ -136,7 +163,7 @@ def save_campaigns_batch(campaigns_list):
                 database=TARGET_DATABASE,
                 table=TARGET_TABLE,
                 data=batch_records,
-                unique_columns=["id"]
+                unique_columns=["campaign_id"]  # ✅ Sửa từ "id" thành "campaign_id"
             )
             return len(batch_records)
         
@@ -196,7 +223,7 @@ def main():
     
     if total_campaigns > 0:
         success_rate = total_saved/total_campaigns*100
-        print(f"   Success rate: {success_rate:.1f}%")
+        print(f"   Success rate: {success_rate:.1f}% - Duration: {duration}")
 
 if __name__ == "__main__":
     main()

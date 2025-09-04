@@ -219,6 +219,49 @@ class LarkApiHandle():
         df.replace(np.nan, None, inplace=True)
         return df
 
+    def extract_table_to_list(self, base_id, table_id, mapping_dict, params=None, has_record_id=True, fields_return:Literal['all', 'mapping_only']='mapping_only'):
+        """
+        Lấy dữ liệu từ Lark và transform theo mapping_dict mà không dùng pandas
+        Trả về list[dict]
+        """
+        import re
+        import json
+
+        if not isinstance(mapping_dict, dict):
+            raise TypeError("mapping_dict must be a dictionary")
+        
+        params = params if isinstance(params, dict) else {}
+
+        if fields_return == 'mapping_only':
+            field_names = [
+                re.split(r'[\[\.]', v['path'])[0]
+                for v in mapping_dict.values()
+            ]
+            params['field_names'] = json.dumps(field_names)
+        
+        data = self.list_records(base_id=base_id, table_id=table_id, return_type='full', params=params)
+        if not data:
+            return []
+
+        # Transform list dict theo mapping_dict
+        records = []
+        for item in data:
+            record = {}
+            if has_record_id:
+                record['record_id'] = item.get('record_id')
+            fields = item.get('fields', {})
+
+            for db_column, config in mapping_dict.items():
+                path = config.get('path')
+                if path:
+                    value = extract_json(fields, path)
+                else:
+                    value = None
+                record[db_column] = value
+            records.append(record)
+        
+        return records
+
     def batch_update_from_df(self, base_id, table_id, df: pd.DataFrame):
         data_to_update = df.apply(
             lambda row: {

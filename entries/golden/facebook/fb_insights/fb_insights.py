@@ -24,7 +24,7 @@ TARGET_TABLE = "fb_ad_insights"
 
 # Fast configuration
 START_DATE = "2024-01-01"
-END_DATE = "2025-08-15"
+END_DATE = "2025-08-24"
 MAX_WORKERS = 8  # Parallel threads
 CHUNK_DAYS = 30  # Bigger chunks
 BATCH_SIZE = 500  # Smaller batches for faster saves
@@ -44,6 +44,83 @@ class ThreadSafeCounter:
         with self._lock:
             return self._value
 
+# Helper functions to add:
+
+def extract_website_ctr(website_ctr_data):
+    """Extract website CTR from API response"""
+    if not website_ctr_data or not isinstance(website_ctr_data, list):
+        return 0.0
+    
+    for item in website_ctr_data:
+        if isinstance(item, dict) and item.get('action_type') == 'link_click':
+            return safe_convert_float(item.get('value'), default=0.0)
+    
+    return 0.0
+
+
+def extract_video_metric(video_data):
+    """Extract video metrics from API response"""
+    if not video_data or not isinstance(video_data, list):
+        return 0
+    
+    for item in video_data:
+        if isinstance(item, dict) and item.get('action_type') == 'video_view':
+            return safe_convert_int(item.get('value'), default=0)
+    
+    return 0
+
+
+# Updated action mappings - add missing ones:
+def safe_process_actions(actions):
+    action_dict = {}
+    if not actions or not isinstance(actions, list):
+        return action_dict
+    
+    try:
+        action_mappings = {
+            'page_engagement': 'page_engagement',
+            'post_engagement': 'post_engagement', 
+            'link_click': 'link_click',
+            'video_view': 'video_view',
+            'post_reaction': 'post_reaction',
+            'like': 'page_like',
+            'comment': 'comment',
+            'post': 'post_share',
+            'landing_page_view': 'landing_page_view',
+            'onsite_conversion.messaging_first_reply': 'message',
+            'onsite_conversion.total_messaging_connection': 'total_messaging_connection',
+            'offsite_conversion.fb_pixel_complete_registration': 'complete_registration',
+            
+            # ADD MISSING MAPPINGS:
+            'onsite_conversion.post_save': 'post_save',
+            'onsite_conversion.purchase': 'purchase',
+            'onsite_app_purchase': 'purchase',  # Alternative purchase action
+            'onsite_web_purchase': 'purchase',  # Alternative purchase action
+            'omni_purchase': 'purchase',        # Alternative purchase action
+            
+            # For message_all, might need special logic to sum multiple message types
+        }
+        
+        for action in actions:
+            if isinstance(action, dict) and 'action_type' in action and 'value' in action:
+                action_type = action.get('action_type')
+                value = action.get('value')
+                
+                if action_type in action_mappings:
+                    column_name = action_mappings[action_type]
+                    
+                    if column_name == 'link_click':
+                        action_dict[column_name] = safe_convert_float(value, default=0.0)
+                    elif column_name == 'purchase':
+                        # Sum multiple purchase types
+                        current_val = action_dict.get(column_name, 0)
+                        action_dict[column_name] = current_val + safe_convert_int(value, default=0)
+                    else:
+                        action_dict[column_name] = safe_convert_int(value, default=0)
+        
+        return action_dict
+    except:
+        return {}
 
 def safe_convert_float(value, default=0.0):
     if value is None or str(value).strip() in ['', 'nan', 'None', 'null']:
@@ -68,165 +145,36 @@ def safe_convert_int(value, default=0):
     except:
         return default
 
-
-def safe_process_actions(actions):
-    action_dict = {}
-    if not actions or not isinstance(actions, list):
-        return action_dict
+def process_video_data(row):
+    """Process video data from Facebook API response"""
+    video_fields = {
+        'video_play_actions': 'video_play',
+        'video_avg_time_watched_actions': 'video_avg_time_watched', 
+        'video_p25_watched_actions': 'video_p25_watched',
+        'video_p50_watched_actions': 'video_p50_watched',
+        'video_p75_watched_actions': 'video_p75_watched',
+        'video_p95_watched_actions': 'video_p95_watched',
+        'video_p100_watched_actions': 'video_p100_watched'
+    }
     
-    try:
-        action_mappings = {
-            'page_engagement': 'page_engagement',
-            'post_engagement': 'post_engagement',
-            'link_click': 'link_click',
-            'video_view': 'video_view',
-            'post_reaction': 'post_reaction',
-            'like': 'page_like',
-            'comment': 'comment',
-            'post': 'post_share',
-            'landing_page_view': 'landing_page_view',
-            'onsite_conversion.messaging_first_reply': 'message',
-            'onsite_conversion.total_messaging_connection': 'total_messaging_connection',
-            'offsite_conversion.fb_pixel_complete_registration': 'complete_registration',
-        }
-        
-        for action in actions:
-            if isinstance(action, dict) and 'action_type' in action and 'value' in action:
-                action_type = action.get('action_type')
-                value = action.get('value')
-                
-                if action_type in action_mappings:
-                    column_name = action_mappings[action_type]
-                    if column_name == 'link_click':
-                        action_dict[column_name] = safe_convert_float(value, default=0.0)
+    video_data = {}
+    
+    for api_field, db_field in video_fields.items():
+        video_array = row.get(api_field, [])
+        if video_array and isinstance(video_array, list):
+            for item in video_array:
+                if isinstance(item, dict) and item.get('action_type') == 'video_view':
+                    if db_field == 'video_avg_time_watched':
+                        # Average time is usually in seconds, keep as int
+                        video_data[db_field] = safe_convert_int(item.get('value'), default=0)
                     else:
-                        action_dict[column_name] = safe_convert_int(value, default=0)
-        
-        return action_dict
-    except:
-        return {}
-
-
-def create_fast_record(row, market=None):
-    """Simplified record creation for speed"""
-    try:
-        actions_data = safe_process_actions(row.get('actions', []))
-        
-        record = {
-            "account_id": str(row.get("account_id", ""))[:50] or None,
-            "ad_account": str(row.get("account_name", ""))[:255] or None,
-            "ad_id": str(row.get("ad_id", ""))[:50] or None,
-            "ad_name": str(row.get("ad_name", ""))[:255] or None,
-            "adset_id": str(row.get("adset_id", ""))[:50] or None,
-            "adset_name": str(row.get("adset_name", ""))[:255] or None,
-            "campaign_id": str(row.get("campaign_id", ""))[:50] or None,
-            "campaign_name": str(row.get("campaign_name", ""))[:255] or None,
-            "objective": str(row.get("objective", ""))[:100] or None,
-            "market": str(market)[:255] if market else None,
-            
-            "spend": safe_convert_float(row.get("spend"), default=0.0),
-            "reach": safe_convert_int(row.get("reach"), default=0),
-            "clicks": safe_convert_int(row.get("clicks"), default=0),
-            "impressions": safe_convert_int(row.get("impressions"), default=0),
-            "unique_clicks": safe_convert_int(row.get("unique_clicks"), default=0),
-            "frequency": safe_convert_float(row.get("frequency"), default=0.0),
-            
-            "date": str(row.get("date_start", ""))[:10] if row.get("date_start") else None,
-            "updated_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        }
-        
-        record.update(actions_data)
-        
-        # Only keep essential fields for speed
-        essential_defaults = {
-            "page_engagement": 0,
-            "post_engagement": 0,
-            "link_click": 0.0,
-            "video_view": 0,
-            "page_like": 0,
-            "comment": 0,
-            "message": 0,
-            "total_messaging_connection": 0,
-            "complete_registration": 0,
-            "landing_page_view": 0,
-            "post_reaction": 0
-        }
-        
-        for field, default in essential_defaults.items():
-            if field not in record:
-                record[field] = default
-        
-        return {k: v for k, v in record.items() if v is not None}
-        
-    except Exception as e:
-        return None
-
-
-def get_campaigns_from_database():
-    """Get campaigns with exclusions"""
-    excluded_campaigns = [
-        '120238169857720112', '120210918037800191', '120210920633150191', '120211113880650191',
-        '120211191501270191', '120211323990870191', '120211397474660191', '120211434499720191',
-        '120211614768540191', '120211632686960191', '120211759623680191', '120211765886460191',
-        '120211816633900191', '120211857972180191', '120211874374870191', '120211876554340191',
-        '120211917489870191', '120212055910040191', '120212158115900191', '120212277412410191',
-        '120212303253370191', '120212323209390191', '120212366236330191', '120212414919150191',
-        '120213618406880191', '120213733461070191', '120214038093820191', '120214063319190191',
-        '120214063548810191', '120214242489510191', '120214270972430191', '120214937409200191',
-        '120215135202290191', '120215163383930191', '120215193643220191', '120215268237610191',
-        '120215302771650191', '120215359990150191', '120215392537190191', '120215455280980191',
-        '120215646296860191', '120215863982790191', '120215915442350191', '120216041153610191',
-        '120219915000980191', '120219915000990191', '120219922151480191', '120219964506250191',
-        '120219998354590191', '120219999387800191', '120219999387810191', '120220000613370191',
-        '120220001123720191', '120220002470680191', '120220003538160191', '120220003555020191',
-        '120220056125190191', '120220056242060191'
-    ]
-    
-    # Create placeholders for IN clause
-    placeholders = ','.join(['%s'] * len(excluded_campaigns))
-    
-    query = f"""
-        SELECT 
-            campaign_id,
-            access_token,
-            market
-        FROM 
-            fb_ad_campaigns
-        WHERE 
-            access_token IS NOT NULL 
-            AND access_token != ''
-            AND campaign_id NOT IN ({placeholders})
-        ORDER BY 
-            market, campaign_id
-    """
-    
-    try:
-        mdb = MariaDBHandler()
-        campaigns = mdb.read_from_db(
-            database=TARGET_DATABASE,
-            query=query,
-            params=tuple(excluded_campaigns),
-            output_type="list_of_dicts"
-        )
-        
-        if campaigns:
-            markets = {}
-            for campaign in campaigns:
-                market = campaign['market'] or 'Unknown'
-                markets[market] = markets.get(market, 0) + 1
-            
-            print(f"✅ Found {len(campaigns)} campaigns (excluded {len(excluded_campaigns)}):")
-            for market, count in markets.items():
-                print(f"   {market}: {count}")
-            
-            return campaigns
+                        # All other video metrics are counts
+                        video_data[db_field] = safe_convert_int(item.get('value'), default=0)
+                    break
         else:
-            return []
-            
-    except Exception as e:
-        print(f"❌ Error getting campaigns: {e}")
-        return []
-
+            video_data[db_field] = 0
+    
+    return video_data
 
 def get_fast_date_ranges(start_date, end_date, chunk_days=30):
     """Create larger date chunks for faster processing"""
@@ -259,7 +207,7 @@ def extract_campaign_chunk(args):
         endpoint = f"{campaign_id}/insights"
         params = {
             # Reduced fields for speed
-            "fields": "account_id,account_name,campaign_id,campaign_name,adset_id,adset_name,ad_id,ad_name,spend,reach,clicks,impressions,unique_clicks,frequency,date_start,actions,objective",
+            "fields": "clicks,unique_clicks,account_id,reach,ad_id,ad_name,adset_id,adset_name,campaign_id,campaign_name,spend,impressions,frequency,actions,website_ctr,video_play_actions,video_avg_time_watched_actions,video_p25_watched_actions,video_p50_watched_actions,video_p75_watched_actions,video_p95_watched_actions,video_p100_watched_actions",
             "level": "ad",
             "time_increment": 1,
             "time_range": f'{{"since":"{date_range["since"]}","until":"{date_range["until"]}"}}',
@@ -326,6 +274,124 @@ def save_fast_batch(records_list):
         print(f"❌ Fast save failed: {str(e)[:50]}...")
         return 0
 
+def create_fast_record(row, market=None):
+    """Simplified record creation for speed - COMPLETE VERSION"""
+    try:
+        actions_data = safe_process_actions(row.get('actions', []))
+        video_data = process_video_data(row)
+        
+        record = {
+            "account_id": str(row.get("account_id", ""))[:50] or None,
+            "ad_account": str(row.get("account_name", ""))[:255] or None,
+            "ad_id": str(row.get("ad_id", ""))[:50] or None,
+            "ad_name": str(row.get("ad_name", ""))[:255] or None,
+            "adset_id": str(row.get("adset_id", ""))[:50] or None,
+            "adset_name": str(row.get("adset_name", ""))[:255] or None,
+            "campaign_id": str(row.get("campaign_id", ""))[:50] or None,
+            "campaign_name": str(row.get("campaign_name", ""))[:255] or None,
+            "objective": str(row.get("objective", ""))[:100] or None,
+            "market": str(market)[:255] if market else None,
+            
+            "spend": safe_convert_float(row.get("spend"), default=0.0),
+            "reach": safe_convert_int(row.get("reach"), default=0),
+            "clicks": safe_convert_int(row.get("clicks"), default=0),
+            "impressions": safe_convert_int(row.get("impressions"), default=0),
+            "unique_clicks": safe_convert_int(row.get("unique_clicks"), default=0),
+            "frequency": safe_convert_float(row.get("frequency"), default=0.0),
+            
+            # Website CTR
+            "website_ctr": extract_website_ctr(row.get("website_ctr", [])),
+            
+            # Raw actions for reference
+            # "actions": json.dumps(row.get("actions", []), ensure_ascii=False) if row.get("actions") else None,
+            
+            "date": str(row.get("date_start", ""))[:10] if row.get("date_start") else None,
+            "updated_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "tf_partition_date": str(row.get("date_start", ""))[:10] if row.get("date_start") else None,
+        }
+        
+        # Add video data
+        record.update(video_data)
+        
+        # Add actions data
+        record.update(actions_data)
+        
+        # Set defaults for missing fields
+        essential_defaults = {
+            "page_engagement": 0,
+            "post_engagement": 0,
+            "link_click": 0.0,
+            "video_view": 0,
+            "page_like": 0,
+            "comment": 0,
+            "message": 0,
+            "total_messaging_connection": 0,
+            "complete_registration": 0,
+            "landing_page_view": 0,
+            "post_reaction": 0,
+            "post_share": 0,
+            "post_save": 0,
+            "purchase": 0,
+            "message_all": 0,
+        }
+        
+        for field, default in essential_defaults.items():
+            if field not in record:
+                record[field] = default
+        
+        return {k: v for k, v in record.items() if v is not None}
+        
+    except Exception as e:
+        logging.error(f"Error creating record: {e}")
+        return None
+
+def get_campaigns_from_database():
+    """Get campaigns with exclusions"""
+    excluded_campaigns = []
+    
+    # Create placeholders for IN clause
+    # placeholders = ','.join(['%s'] * len(excluded_campaigns))
+    
+    query = f"""
+        SELECT 
+            campaign_id,
+            access_token,
+            market
+        FROM 
+            fb_ad_campaigns
+        WHERE 
+            access_token IS NOT NULL 
+            AND access_token != ''
+        ORDER BY 
+            market, campaign_id
+    """
+    
+    try:
+        mdb = MariaDBHandler()
+        campaigns = mdb.read_from_db(
+            database=TARGET_DATABASE,
+            query=query,
+            params=tuple(excluded_campaigns),
+            output_type="list_of_dicts"
+        )
+        
+        if campaigns:
+            markets = {}
+            for campaign in campaigns:
+                market = campaign['market'] or 'Unknown'
+                markets[market] = markets.get(market, 0) + 1
+            
+            print(f"✅ Found {len(campaigns)} campaigns (excluded {len(excluded_campaigns)}):")
+            for market, count in markets.items():
+                print(f"   {market}: {count}")
+            
+            return campaigns
+        else:
+            return []
+            
+    except Exception as e:
+        print(f"❌ Error getting campaigns: {e}")
+        return []
 
 def main():
     print(f"🚀 Facebook Insights - FAST PARALLEL EXTRACTION (Incremental Save)")
@@ -428,6 +494,227 @@ def main():
         print(f"❌ Main error: {e}")
         import traceback
         traceback.print_exc()
+
+
+
+# def create_record(row, market=None):
+#     """Create database record from API response"""
+#     try:
+#         actions_data = safe_process_actions(row.get('actions', []))
+#         video_data = process_video_data(row)
+        
+#         record = {
+#             "account_id": str(row.get("account_id", ""))[:50] or None,
+#             "ad_account": str(row.get("account_name", ""))[:255] or None,
+#             "ad_id": str(row.get("ad_id", ""))[:50] or None,
+#             "ad_name": str(row.get("ad_name", ""))[:255] or None,
+#             "adset_id": str(row.get("adset_id", ""))[:50] or None,
+#             "adset_name": str(row.get("adset_name", ""))[:255] or None,
+#             "campaign_id": str(row.get("campaign_id", ""))[:50] or None,
+#             "campaign_name": str(row.get("campaign_name", ""))[:255] or None,
+#             "objective": str(row.get("objective", ""))[:100] or None,
+#             "market": str(market)[:255] if market else None,
+            
+#             "spend": safe_convert_float(row.get("spend"), default=0.0),
+#             "reach": safe_convert_int(row.get("reach"), default=0),
+#             "clicks": safe_convert_int(row.get("clicks"), default=0),
+#             "impressions": safe_convert_int(row.get("impressions"), default=0),
+#             "unique_clicks": safe_convert_int(row.get("unique_clicks"), default=0),
+#             "frequency": safe_convert_float(row.get("frequency"), default=0.0),
+            
+#             # Website CTR
+#             "website_ctr": extract_website_ctr(row.get("website_ctr", [])),
+            
+#             # Raw actions for reference
+#             # "actions": json.dumps(row.get("actions", []), ensure_ascii=False) if row.get("actions") else None,
+            
+#             "date": str(row.get("date_start", ""))[:10] if row.get("date_start") else None,
+#             "updated_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+#             "tf_partition_date": str(row.get("date_start", ""))[:10] if row.get("date_start") else None,
+#         }
+        
+#         # Add video data
+#         record.update(video_data)
+        
+#         # Add actions data
+#         record.update(actions_data)
+        
+#         # Set defaults for missing fields
+#         essential_defaults = {
+#             "page_engagement": 0,
+#             "post_engagement": 0,
+#             "link_click": 0.0,
+#             "video_view": 0,
+#             "page_like": 0,
+#             "comment": 0,
+#             "message": 0,
+#             "total_messaging_connection": 0,
+#             "complete_registration": 0,
+#             "landing_page_view": 0,
+#             "post_reaction": 0,
+#             "post_share": 0,
+#             "post_save": 0,
+#             "purchase": 0,
+#             "message_all": 0,
+#         }
+        
+#         for field, default in essential_defaults.items():
+#             if field not in record:
+#                 record[field] = default
+        
+#         return {k: v for k, v in record.items() if v is not None}
+        
+#     except Exception as e:
+#         logging.error(f"Error creating record: {e}")
+#         return None
+
+
+# def get_campaign_info(campaign_id):
+#     """Get campaign info from database"""
+#     query = """
+#         SELECT 
+#             campaign_id,
+#             access_token,
+#             market,
+#             campaign_name
+#         FROM 
+#             fb_ad_campaigns
+#         WHERE 
+#             campaign_id = %s
+#             AND access_token IS NOT NULL 
+#             AND access_token != ''
+#     """
+    
+#     try:
+#         mdb = MariaDBHandler()
+#         result = mdb.read_from_db(
+#             database=TARGET_DATABASE,
+#             query=query,
+#             params=(campaign_id,),
+#             output_type="list_of_dicts"
+#         )
+        
+#         if result:
+#             campaign = result[0]
+#             logging.info(f"✅ Found campaign: {campaign['campaign_name']} ({campaign['market']})")
+#             return campaign
+#         else:
+#             logging.error(f"❌ Campaign {campaign_id} not found in database")
+#             return None
+            
+#     except Exception as e:
+#         logging.error(f"❌ Error getting campaign info: {e}")
+#         return None
+
+# def extract_single_campaign(campaign_id, start_date, end_date):
+#     """Extract insights for single campaign"""
+#     # Get campaign info
+#     campaign = get_campaign_info(campaign_id)
+#     if not campaign:
+#         return
+    
+#     access_token = campaign['access_token']
+#     market = campaign['market']
+#     campaign_name = campaign['campaign_name']
+    
+#     logging.info(f"🚀 Extracting insights for campaign: {campaign_name}")
+#     logging.info(f"📅 Date range: {start_date} to {end_date}")
+#     logging.info(f"🏷️  Market: {market}")
+    
+#     try:
+#         # Initialize Facebook API handler
+#         fb_handler = FacebookAPIHandler(access_token=access_token, timeout=120, max_retries=3)
+        
+#         endpoint = f"{campaign_id}/insights"
+#         params = {
+#             "fields": "account_id,account_name,campaign_id,campaign_name,adset_id,adset_name,ad_id,ad_name,spend,reach,clicks,impressions,unique_clicks,frequency,date_start,actions,objective,website_ctr,video_play_actions,video_avg_time_watched_actions,video_p25_watched_actions,video_p50_watched_actions,video_p75_watched_actions,video_p95_watched_actions,video_p100_watched_actions",
+#             "level": "ad",
+#             "time_increment": 1,
+#             "time_range": f'{{"since":"{start_date}","until":"{end_date}"}}',
+#             "limit": 1000,
+#             "filtering": '''[{"field": "spend", "operator": "GREATER_THAN", "value": 0}]'''
+#         }
+        
+#         logging.info("📡 Making API request...")
+#         data = fb_handler.get_all(endpoint=endpoint, params=params)
+        
+#         if not data:
+#             logging.warning("📭 No data returned from API")
+#             return
+        
+#         logging.info(f"📊 Retrieved {len(data)} records from API")
+        
+#         # Process records
+#         records = []
+#         for row in data:
+#             record = create_record(row, market=market)
+#             if record:
+#                 records.append(record)
+        
+#         logging.info(f"✅ Processed {len(records)} valid records")
+        
+#         # Save to database in batches
+#         if records:
+#             batch_size = 100
+#             total_saved = 0
+            
+#             for i in range(0, len(records), batch_size):
+#                 batch = records[i:i+batch_size]
+                
+#                 try:
+#                     mdb = MariaDBHandler()
+#                     mdb.insert_and_update_from_dict(
+#                         database=TARGET_DATABASE,
+#                         table=TARGET_TABLE,
+#                         data=batch,
+#                         unique_columns=["ad_id", "date"],
+#                         log=False
+#                     )
+                    
+#                     total_saved += len(batch)
+#                     logging.info(f"💾 Saved batch {i//batch_size + 1}: {len(batch)} records")
+                    
+#                 except Exception as e:
+#                     logging.error(f"❌ Batch save failed: {e}")
+#                     continue
+            
+#             logging.info(f"🎯 COMPLETED: {total_saved}/{len(records)} records saved to database")
+            
+#             # Show sample data
+#             if records:
+#                 sample = records[0]
+#                 logging.info(f"📋 Sample record:")
+#                 logging.info(f"   Ad ID: {sample.get('ad_id')}")
+#                 logging.info(f"   Date: {sample.get('date')}")
+#                 logging.info(f"   Spend: ${sample.get('spend', 0):.2f}")
+#                 logging.info(f"   Impressions: {sample.get('impressions', 0):,}")
+#                 logging.info(f"   Clicks: {sample.get('clicks', 0):,}")
+#                 logging.info(f"   Video Play: {sample.get('video_play', 0):,}")
+#                 logging.info(f"   Website CTR: {sample.get('website_ctr', 0):.2f}%")
+        
+#     except Exception as e:
+#         logging.error(f"❌ Extraction failed: {e}")
+#         import traceback
+#         traceback.print_exc()
+#     finally:
+#         if 'fb_handler' in locals():
+#             fb_handler.close()
+
+# def main():
+#     """Main function - extract single campaign"""
+#     logging.info(f"🎯 Single Campaign Facebook Insights Extractor")
+#     logging.info(f"📋 Target Campaign: {120238384811600112}")
+#     logging.info(f"🗄️  Database: {TARGET_DATABASE}.{TARGET_TABLE}")
+    
+#     start_time = datetime.now()
+    
+#     # Extract the campaign
+#     extract_single_campaign(120238384811600112, START_DATE, END_DATE)
+    
+#     # Final summary
+#     duration = datetime.now() - start_time
+#     logging.info(f"⏱️  Total duration: {duration}")
+#     logging.info(f"✅ Extraction completed!")
 
 
 if __name__ == "__main__":
